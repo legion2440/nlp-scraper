@@ -15,16 +15,45 @@ import pandas as pd
 import spacy
 from nltk.sentiment import SentimentIntensityAnalyzer
 
-KEYWORDS = [
+SCANDAL_KEYWORDS = [
     "oil spill",
     "water pollution",
     "air pollution",
     "chemical contamination",
+    "toxic chemical leak",
+    "hazardous waste dumping",
     "industrial pollution",
-    "deforestation",
-    "environmental disaster",
-    "ecological damage",
+    "illegal deforestation",
+    "environmental damage",
+    "ecological disaster",
 ]
+
+# Strong evidence of environmental harm. Generic topic words such as "oil",
+# "water", and "air" are intentionally absent to avoid market/news false positives.
+HARM_LEMMAS = {
+    "contaminate",
+    "contamination",
+    "deforest",
+    "deforestation",
+    "discharge",
+    "dump",
+    "hazardous",
+    "leak",
+    "poison",
+    "pollutant",
+    "pollute",
+    "pollution",
+    "sewage",
+    "spill",
+    "toxic",
+}
+HARM_PHRASES = {
+    "ecological damage",
+    "environmental damage",
+    "hazardous waste",
+    "oil slick",
+}
+IGNORED_ORGS = {"euronews"}
 
 
 def load_nlp(name):
@@ -32,8 +61,7 @@ def load_nlp(name):
         return spacy.load(name)
     except OSError as exc:
         raise RuntimeError(
-            f"spaCy model '{name}' is missing. "
-            f"Run: python -m spacy download {name}"
+            f"spaCy model '{name}' is missing. Install requirements.txt first."
         ) from exc
 
 
@@ -45,13 +73,22 @@ def load_sentiment():
         return SentimentIntensityAnalyzer()
 
 
+def normalize_org(value):
+    return " ".join(value.casefold().split()).strip(" .")
+
+
+def is_ignored_org(value):
+    normalized = normalize_org(value)
+    return normalized in IGNORED_ORGS or normalized.startswith("euronews ")
+
+
 def cosine(left, right):
     denominator = float(np.linalg.norm(left) * np.linalg.norm(right))
     return 0.0 if denominator == 0 else float(np.dot(left, right) / denominator)
 
 
 def build_keyword_vectors(nlp):
-    vectors = [nlp(keyword).vector for keyword in KEYWORDS]
+    vectors = [nlp(keyword).vector for keyword in SCANDAL_KEYWORDS]
     vectors = [vector for vector in vectors if np.linalg.norm(vector) > 0]
     if not vectors:
         raise RuntimeError(
@@ -60,28 +97,74 @@ def build_keyword_vectors(nlp):
     return vectors
 
 
+def sentence_has_harm_marker(sentence):
+    lemmas = {
+        token.lemma_.casefold()
+        for token in sentence
+        if token.is_alpha
+    }
+    if lemmas & HARM_LEMMAS:
+        return True
+
+    lowered = sentence.text.casefold()
+    return any(phrase in lowered for phrase in HARM_PHRASES)
+
+
+def sentence_organizations(sentence):
+    return sorted(
+        {
+            ent.text.strip()
+            for ent in sentence.ents
+            if ent.label_ == "ORG"
+            and ent.text.strip()
+            and not is_ignored_org(ent.text)
+        }
+    )
+
+
 def analyze_document(nlp, text, keyword_vectors):
     doc = nlp(text)
     organizations = sorted(
         {
             ent.text.strip()
             for ent in doc.ents
-            if ent.label_ == "ORG" and ent.text.strip()
+            if ent.label_ == "ORG"
+            and ent.text.strip()
+            and not is_ignored_org(ent.text)
         }
     )
 
-    best_similarity = 0.0
-    for sentence in doc.sents:
-        if not any(ent.label_ == "ORG" for ent in sentence.ents):
-            continue
-        if np.linalg.norm(sentence.vector) == 0:
-            continue
-        best_similarity = max(
-            best_similarity,
-            max(cosine(sentence.vector, vector) for vector in keyword_vectors),
-        )
+    best_distance = 2.0
+    best_org = None
+    best_sentence = None
 
-    return organizations, float(np.clip(1.0 - best_similarity, 0.0, 2.0))
+    for sentence in doc.sents:
+        orgs = sentence_organizations(sentence)
+        if not orgs or np.linalg.norm(sentence.vector) == 0:
+            continue
+
+        semantic_similarity = max(
+            cosine(sentence.vector, vector) for vector in keyword_vectors
+        )
+        semantic_similarity = float(np.clip(semantic_similarity, 0.0, 1.0))
+        semantic_distance = 1.0 - semantic_similarity
+
+        # All entity-containing sentences are compared semantically as required.
+        # A sentence without an explicit environmental-harm marker is placed in
+        # the [1, 2] distance band, while harm-bearing sentences stay in [0, 1].
+        # This prevents generic oil/water/air business stories from outranking
+        # actual pollution, spills, contamination, or deforestation.
+        if sentence_has_harm_marker(sentence):
+            adjusted_distance = semantic_distance
+        else:
+            adjusted_distance = 1.0 + semantic_distance
+
+        if adjusted_distance < best_distance:
+            best_distance = adjusted_distance
+            best_org = orgs[0]
+            best_sentence = sentence.text.strip()
+
+    return doc, organizations, float(best_distance), best_org, best_sentence
 
 
 def load_articles(database, limit):
@@ -107,6 +190,17 @@ def load_articles(database, limit):
     return frame
 
 
+def article_sentiment(analyzer, doc):
+    scores = [
+        analyzer.polarity_scores(sentence.text)["compound"]
+        for sentence in doc.sents
+        if sentence.text.strip()
+    ]
+    if not scores:
+        return 0.0
+    return float(np.mean(scores))
+
+
 def sentiment_label(score):
     if score >= 0.05:
         return "positive"
@@ -128,29 +222,36 @@ def enrich(args):
         print(f"\nEnriching {article['url']}:")
 
         print("---------- Detect entities ----------")
-        organizations, scandal_distance = analyze_document(
-            nlp, document, keyword_vectors
-        )
+        (
+            doc,
+            organizations,
+            scandal_distance,
+            scandal_org,
+            scandal_sentence,
+        ) = analyze_document(nlp, document, keyword_vectors)
         print(
             f"Detected {len(organizations)} companies/organizations: "
             + ", ".join(organizations[:10])
         )
 
         print("---------- Topic detection ----------")
+        print("Text preprocessing ...")
         topic = str(classifier.predict([document])[0])
         print(f"The topic of the article is: {topic}")
 
         print("---------- Sentiment analysis ----------")
-        sentiment_score = float(
-            sentiment.polarity_scores(document)["compound"]
-        )
+        sentiment_score = article_sentiment(sentiment, doc)
         print(
-            f"The article has a {sentiment_label(sentiment_score)} sentiment "
+            f"The article {article['headline']} has a "
+            f"{sentiment_label(sentiment_score)} sentiment "
             f"({sentiment_score:.3f})"
         )
 
         print("---------- Scandal detection ----------")
+        print("Computing embeddings and distance ...")
         print(f"Environmental scandal distance: {scandal_distance:.4f}")
+        if scandal_org:
+            print(f"Closest candidate organization: {scandal_org}")
 
         rows.append(
             {
@@ -164,17 +265,30 @@ def enrich(args):
                 "Sentiment": sentiment_score,
                 "Scandal_distance": scandal_distance,
                 "Top_10": False,
+                "_Scandal_org": scandal_org,
+                "_Scandal_sentence": scandal_sentence,
             }
         )
 
     result = pd.DataFrame(rows)
-    result.loc[
-        result.nsmallest(10, "Scandal_distance").index, "Top_10"
-    ] = True
+    top_indices = result.nsmallest(10, "Scandal_distance").index
+    result.loc[top_indices, "Top_10"] = True
 
+    print("\n---------- Top environmental scandal candidates ----------")
+    for _, row in result.loc[top_indices].sort_values(
+        "Scandal_distance"
+    ).iterrows():
+        organization = row["_Scandal_org"]
+        if organization:
+            print(f"Environmental scandal detected for {organization}")
+            print(f"  {row['Headline']}")
+            if row["_Scandal_sentence"]:
+                print(f"  Evidence: {row['_Scandal_sentence']}")
+
+    output = result.drop(columns=["_Scandal_org", "_Scandal_sentence"])
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    result.to_csv(args.output, index=False)
-    print(f"\nSaved {len(result)} enriched articles to {args.output}")
+    output.to_csv(args.output, index=False)
+    print(f"\nSaved {len(output)} enriched articles to {args.output}")
     return 0
 
 
