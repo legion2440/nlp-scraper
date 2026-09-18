@@ -8,8 +8,6 @@ venv/
 
 data/*
 !data/.gitkeep
-results/*
-!results/.gitkeep
 
 topic_classifier.pkl
 *.db
