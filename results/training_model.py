@@ -31,13 +31,25 @@ def download_if_missing(path: Path, url: str) -> None:
     print(f"Downloaded {path}")
 
 
-def load_dataset(path: Path) -> tuple[pd.Series, pd.Series]:
+def load_dataset(
+    path: Path,
+    *,
+    deduplicate: bool = False,
+) -> tuple[pd.Series, pd.Series]:
     frame = pd.read_csv(path)
     required = {"Text", "Category"}
     missing = required - set(frame.columns)
     if missing:
         raise ValueError(f"{path} is missing columns: {sorted(missing)}")
     frame = frame.dropna(subset=["Text", "Category"])
+
+    if deduplicate:
+        before = len(frame)
+        frame = frame.drop_duplicates(subset=["Text"], keep="first")
+        removed = before - len(frame)
+        print(f"Removed {removed} duplicate training texts")
+
+    frame = frame.reset_index(drop=True)
     return frame["Text"].astype(str), frame["Category"].astype(str)
 
 
@@ -114,12 +126,20 @@ def save_learning_curves(
     plt.savefig(output, dpi=150)
     plt.close()
 
+    gap = train_mean[-1] - validation_mean[-1]
+    print(
+        "Learning curve at full training size: "
+        f"train={train_mean[-1]:.2%}, "
+        f"cv={validation_mean[-1]:.2%}, "
+        f"gap={gap:.2%}"
+    )
+
 
 def train(args: argparse.Namespace) -> int:
     download_if_missing(args.train, TRAIN_URL)
     download_if_missing(args.test, TEST_URL)
 
-    x_train, y_train = load_dataset(args.train)
+    x_train, y_train = load_dataset(args.train, deduplicate=True)
     x_test, y_test = load_dataset(args.test)
 
     model = build_classifier()
@@ -131,6 +151,20 @@ def train(args: argparse.Namespace) -> int:
 
     print(f"Test accuracy: {accuracy:.4%}")
     print(classification_report(y_test, predictions, digits=4))
+
+    train_texts = set(x_train.tolist())
+    non_overlap_mask = ~x_test.isin(train_texts).to_numpy()
+    overlap_count = int((~non_overlap_mask).sum())
+    if non_overlap_mask.any():
+        non_overlap_accuracy = accuracy_score(
+            y_test.to_numpy()[non_overlap_mask],
+            predictions[non_overlap_mask],
+        )
+        print(
+            "Test accuracy excluding train/test text overlap: "
+            f"{non_overlap_accuracy:.4%} "
+            f"({overlap_count} overlapping test rows excluded)"
+        )
 
     if accuracy < args.min_accuracy:
         raise RuntimeError(
