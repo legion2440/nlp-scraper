@@ -17,7 +17,7 @@ from typing import Iterable
 import requests
 from bs4 import BeautifulSoup
 
-DEFAULT_SITEMAP = "https://www.euronews.com/sitemaps/en/articles.xml"
+DEFAULT_SITEMAP = "https://www.euronews.com/sitemap/articles.xml"
 DEFAULT_DB = Path("data/news.db")
 USER_AGENT = "nlp-scraper/1.0 (+https://github.com/legion2440/nlp-scraper)"
 
@@ -243,18 +243,29 @@ def scrape(args: argparse.Namespace) -> int:
     print(
         f"Discovering articles newer than {cutoff.date()} from {args.sitemap}"
     )
-    urls = discover_recent_urls(session, args.sitemap, cutoff)
+    try:
+        urls = discover_recent_urls(session, args.sitemap, cutoff)
+    except (requests.RequestException, ET.ParseError) as exc:
+        print(f"Failed to load sitemap {args.sitemap}: {exc}")
+        return 2
+
     print(f"Discovered {len(urls)} candidate URLs")
 
     connection = initialize_database(args.db)
     existing = stored_urls(connection)
+    target_new = max(0, args.limit - len(existing))
     saved = 0
+
+    if target_new == 0:
+        connection.close()
+        print(f"Database already contains at least {args.limit} articles")
+        return 0
 
     try:
         for index, url in enumerate(urls, start=1):
             if url in existing:
                 continue
-            if saved >= args.limit:
+            if saved >= target_new:
                 break
 
             print(f"{index}. scraping {url}")
@@ -269,10 +280,16 @@ def scrape(args: argparse.Namespace) -> int:
                 print("   skipped: article content could not be extracted")
                 continue
 
+            published_at = parse_datetime(article.date_published)
+            if published_at is not None and published_at < cutoff:
+                print("   skipped: article is older than the requested window")
+                continue
+
             if insert_article(connection, article):
                 saved += 1
                 existing.add(url)
-                print(f"   saved ({saved}/{args.limit})")
+                total_progress = len(existing)
+                print(f"   saved ({total_progress}/{args.limit})")
 
             if args.delay:
                 time.sleep(args.delay)
