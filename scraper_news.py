@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Scrape recent Reuters articles into a local SQLite database."""
+"""Scrape recent Euronews articles into a local SQLite database."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ from typing import Iterable
 import requests
 from bs4 import BeautifulSoup
 
-DEFAULT_SITEMAP = "https://www.reuters.com/sitemap.xml"
+DEFAULT_SITEMAP = "https://www.euronews.com/sitemaps/en/articles.xml"
 DEFAULT_DB = Path("data/news.db")
 USER_AGENT = "nlp-scraper/1.0 (+https://github.com/legion2440/nlp-scraper)"
 
