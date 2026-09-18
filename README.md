@@ -19,23 +19,22 @@ The project:
 - stores a stable UUID, URL, scrape date, headline, and body in SQLite;
 - detects organizations with spaCy NER;
 - classifies topics as business, entertainment, politics, sport, or tech;
-- scores sentiment with NLTK VADER;
+- scores sentiment with NLTK VADER, averaged over article sentences to avoid whole-document saturation;
 - ranks articles by environmental-scandal semantic distance;
 - flags exactly ten articles with the smallest scandal distance.
 
 ## Setup
 
-Python 3.10+ is recommended.
+Use Python 3.11–3.13. The pinned stack is tested against this range.
 
 ```bash
 python -m venv .venv
 # Windows: .venv\Scripts\activate
 # Linux/macOS: source .venv/bin/activate
 pip install -r requirements.txt
-python -m spacy download en_core_web_md
 ```
 
-The medium spaCy model is intentional: it provides both `ORG` NER and real word vectors used by the scandal detector.
+The medium spaCy model is pinned in `requirements.txt`. It provides both `ORG` NER and static pretrained vectors used by the scandal detector. These vectors are not treated as a complete semantic model on their own: the scandal score also requires explicit environmental-harm evidence so generic oil, water, or air stories do not dominate the ranking.
 
 ## 1. Scrape news
 
@@ -76,7 +75,7 @@ Model:
 
 ### Overfitting check
 
-Five-fold stratified cross-validation is used to generate learning curves. Training and validation accuracy are plotted against training-set size. A persistent large gap would indicate overfitting; convergence at high accuracy indicates that the classifier generalizes to unseen samples.
+Duplicate training texts are removed before fitting and before the five-fold stratified cross-validation used to generate learning curves. Training and validation accuracy are plotted against training-set size, and the final gap is printed. The script also reports a second test accuracy with exact train/test text overlaps excluded. A persistent large train/CV gap would indicate overfitting; a small gap together with similar held-out accuracy supports generalization.
 
 ## 3. Enrich 300 articles
 
@@ -105,17 +104,19 @@ The detector uses environmental-disaster phrases such as `oil spill`, `water pol
 
 For every article:
 
-1. spaCy detects `ORG` entities;
-2. only sentences containing at least one `ORG` entity are considered;
-3. each sentence and each disaster phrase is represented with spaCy's `en_core_web_md` vectors;
+1. spaCy detects `ORG` entities; the publisher name `Euronews` is excluded;
+2. every sentence containing at least one remaining `ORG` entity is considered;
+3. each such sentence and each disaster phrase is represented with spaCy's `en_core_web_md` vectors;
 4. cosine similarity is computed between every relevant sentence and disaster phrase;
-5. the strongest similarity is retained for the article;
-6. `Scandal_distance = 1 - max_cosine_similarity`;
-7. the ten articles with the smallest distance are flagged with `Top_10 = True`.
+5. the semantic distance is `1 - cosine_similarity`, clipped to the `[0, 1]` band;
+6. sentences with an explicit harm marker such as pollution, contamination, spill, leak, toxic waste, dumping, or deforestation remain in the `[0, 1]` distance band;
+7. sentences without a harm marker receive a +1 penalty and therefore occupy the `[1, 2]` band;
+8. the smallest adjusted distance is retained for the article together with the corresponding organization and evidence sentence;
+9. the ten articles with the smallest final distance are flagged with `Top_10 = True`.
 
 ### Why cosine distance?
 
-Cosine similarity measures semantic direction rather than vector magnitude, which is more useful for comparing textual embeddings of different sentence lengths. Converting it to `1 - similarity` gives an intuitive distance where smaller values mean stronger semantic proximity to the environmental-disaster concepts.
+Cosine similarity measures semantic direction rather than vector magnitude, which is useful for comparing textual embeddings of different sentence lengths. Static word-vector averages can still confuse a topic such as oil markets with an environmental incident, so cosine distance is combined with an explicit harm-evidence penalty. Smaller final values therefore mean both semantic proximity to the disaster concepts and stronger evidence of actual environmental harm.
 
 ## Generated artifacts
 
@@ -127,4 +128,4 @@ results/enhanced_news.csv
 topic_classifier.pkl
 ```
 
-The raw SQLite database and downloaded BBC datasets are local working data and are not committed by default.
+The raw SQLite database and downloaded BBC datasets are local working data and are not committed by default. `learning_curves.png` and `enhanced_news.csv` should be committed only after a real successful run, not generated from synthetic audit data.
