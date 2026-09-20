@@ -28,31 +28,59 @@ SCANDAL_KEYWORDS = [
     "ecological disaster",
 ]
 
-# Strong evidence of environmental harm. Generic topic words such as "oil",
-# "water", and "air" are intentionally absent to avoid market/news false positives.
-HARM_LEMMAS = {
+# These markers are specific enough to count as environmental-harm evidence
+# without extra context.
+STRONG_HARM_LEMMAS = {
     "contaminate",
     "contamination",
     "deforest",
     "deforestation",
+    "pollutant",
+    "pollute",
+    "pollution",
+    "sewage",
+}
+
+# These words are ambiguous in general news. They count as harm evidence only
+# when an environmental-context term occurs in the same sentence.
+AMBIGUOUS_HARM_LEMMAS = {
+    "damage",
     "discharge",
     "dump",
     "hazardous",
     "leak",
     "poison",
-    "pollutant",
-    "pollute",
-    "pollution",
-    "sewage",
+    "slick",
     "spill",
     "toxic",
 }
-HARM_PHRASES = {
-    "ecological damage",
-    "environmental damage",
-    "hazardous waste",
-    "oil slick",
+
+ENVIRONMENT_CONTEXT_LEMMAS = {
+    "air",
+    "beach",
+    "chemical",
+    "coast",
+    "ecological",
+    "ecosystem",
+    "environment",
+    "environmental",
+    "farmland",
+    "forest",
+    "gas",
+    "groundwater",
+    "habitat",
+    "lake",
+    "land",
+    "ocean",
+    "oil",
+    "pipeline",
+    "river",
+    "sea",
+    "soil",
+    "waste",
+    "water",
 }
+
 IGNORED_ORGS = {"euronews"}
 
 
@@ -73,13 +101,33 @@ def load_sentiment():
         return SentimentIntensityAnalyzer()
 
 
-def normalize_org(value):
-    return " ".join(value.casefold().split()).strip(" .")
+def clean_org(value):
+    text = " ".join(value.split()).strip(" .")
+    if text.casefold().startswith("the "):
+        text = text[4:].strip()
+    if text.endswith("'s") or text.endswith("’s"):
+        text = text[:-2].rstrip()
+    return text.strip(" .")
+
+
+def org_key(value):
+    return clean_org(value).casefold()
 
 
 def is_ignored_org(value):
-    normalized = normalize_org(value)
+    normalized = org_key(value)
     return normalized in IGNORED_ORGS or normalized.startswith("euronews ")
+
+
+def normalized_orgs(entities):
+    by_key = {}
+    for ent in entities:
+        if ent.label_ != "ORG" or not ent.text.strip() or is_ignored_org(ent.text):
+            continue
+        cleaned = clean_org(ent.text)
+        if cleaned:
+            by_key.setdefault(cleaned.casefold(), cleaned)
+    return sorted(by_key.values(), key=str.casefold)
 
 
 def cosine(left, right):
@@ -97,50 +145,89 @@ def build_keyword_vectors(nlp):
     return vectors
 
 
-def sentence_has_harm_marker(sentence):
-    lemmas = {
-        token.lemma_.casefold()
+def harm_marker_positions(sentence):
+    # Ignore words inside named entities when deciding environmental context.
+    # This prevents names such as "Organisation for the Prohibition of
+    # Chemical Weapons" from turning "poison" into an environmental match.
+    tokens = [
+        token
         for token in sentence
-        if token.is_alpha
-    }
-    if lemmas & HARM_LEMMAS:
-        return True
+        if token.is_alpha and token.ent_iob_ == "O"
+    ]
+    lemmas = {token.lemma_.casefold() for token in tokens}
 
-    lowered = sentence.text.casefold()
-    return any(phrase in lowered for phrase in HARM_PHRASES)
+    positions = [
+        token.i
+        for token in tokens
+        if token.lemma_.casefold() in STRONG_HARM_LEMMAS
+    ]
+
+    if lemmas & ENVIRONMENT_CONTEXT_LEMMAS:
+        positions.extend(
+            token.i
+            for token in tokens
+            if token.lemma_.casefold() in AMBIGUOUS_HARM_LEMMAS
+        )
+
+    return sorted(set(positions))
 
 
-def sentence_organizations(sentence):
-    return sorted(
-        {
-            ent.text.strip()
-            for ent in sentence.ents
-            if ent.label_ == "ORG"
-            and ent.text.strip()
-            and not is_ignored_org(ent.text)
-        }
+def sentence_org_entities(sentence):
+    entities = []
+    seen = set()
+    for ent in sentence.ents:
+        if ent.label_ != "ORG" or not ent.text.strip() or is_ignored_org(ent.text):
+            continue
+        cleaned = clean_org(ent.text)
+        key = cleaned.casefold()
+        if not cleaned or key in seen:
+            continue
+        seen.add(key)
+        entities.append((cleaned, ent.start, ent.end))
+    return entities
+
+
+def marker_distance_to_entity(marker_position, entity_start, entity_end):
+    if marker_position < entity_start:
+        return entity_start - marker_position
+    if marker_position >= entity_end:
+        return marker_position - entity_end + 1
+    return 0
+
+
+def closest_org_to_markers(org_entities, marker_positions):
+    if not org_entities or not marker_positions:
+        return None
+
+    best = min(
+        org_entities,
+        key=lambda item: min(
+            marker_distance_to_entity(marker, item[1], item[2])
+            for marker in marker_positions
+        ),
     )
+    return best[0]
+
+
+def build_document(headline, body):
+    headline = str(headline).strip()
+    if headline and headline[-1] not in ".!?…":
+        headline += "."
+    return f"{headline}\n{body}"
 
 
 def analyze_document(nlp, text, keyword_vectors):
     doc = nlp(text)
-    organizations = sorted(
-        {
-            ent.text.strip()
-            for ent in doc.ents
-            if ent.label_ == "ORG"
-            and ent.text.strip()
-            and not is_ignored_org(ent.text)
-        }
-    )
+    organizations = normalized_orgs(doc.ents)
 
     best_distance = 2.0
     best_org = None
     best_sentence = None
+    best_has_harm_evidence = False
 
     for sentence in doc.sents:
-        orgs = sentence_organizations(sentence)
-        if not orgs or np.linalg.norm(sentence.vector) == 0:
+        org_entities = sentence_org_entities(sentence)
+        if not org_entities or np.linalg.norm(sentence.vector) == 0:
             continue
 
         semantic_similarity = max(
@@ -149,22 +236,35 @@ def analyze_document(nlp, text, keyword_vectors):
         semantic_similarity = float(np.clip(semantic_similarity, 0.0, 1.0))
         semantic_distance = 1.0 - semantic_similarity
 
-        # All entity-containing sentences are compared semantically as required.
-        # A sentence without an explicit environmental-harm marker is placed in
-        # the [1, 2] distance band, while harm-bearing sentences stay in [0, 1].
-        # This prevents generic oil/water/air business stories from outranking
-        # actual pollution, spills, contamination, or deforestation.
-        if sentence_has_harm_marker(sentence):
+        marker_positions = harm_marker_positions(sentence)
+        has_harm_evidence = bool(marker_positions)
+
+        # Every ORG-containing sentence is compared semantically as required.
+        # Sentences with explicit harm evidence remain in [0, 1]. Others receive
+        # a +1 penalty and therefore stay in [1, 2].
+        if has_harm_evidence:
             adjusted_distance = semantic_distance
+            candidate_org = closest_org_to_markers(
+                org_entities, marker_positions
+            )
         else:
             adjusted_distance = 1.0 + semantic_distance
+            candidate_org = None
 
         if adjusted_distance < best_distance:
             best_distance = adjusted_distance
-            best_org = orgs[0]
+            best_org = candidate_org
             best_sentence = sentence.text.strip()
+            best_has_harm_evidence = has_harm_evidence
 
-    return doc, organizations, float(best_distance), best_org, best_sentence
+    return (
+        doc,
+        organizations,
+        float(best_distance),
+        best_org,
+        best_sentence,
+        best_has_harm_evidence,
+    )
 
 
 def load_articles(database, limit):
@@ -218,7 +318,7 @@ def enrich(args):
 
     rows = []
     for _, article in articles.iterrows():
-        document = f"{article['headline']}\n{article['body']}"
+        document = build_document(article["headline"], article["body"])
         print(f"\nEnriching {article['url']}:")
 
         print("---------- Detect entities ----------")
@@ -226,8 +326,9 @@ def enrich(args):
             doc,
             organizations,
             scandal_distance,
-            scandal_org,
-            scandal_sentence,
+            closest_org,
+            evidence_sentence,
+            has_harm_evidence,
         ) = analyze_document(nlp, document, keyword_vectors)
         print(
             f"Detected {len(organizations)} companies/organizations: "
@@ -250,8 +351,12 @@ def enrich(args):
         print("---------- Scandal detection ----------")
         print("Computing embeddings and distance ...")
         print(f"Environmental scandal distance: {scandal_distance:.4f}")
-        if scandal_org:
-            print(f"Closest candidate organization: {scandal_org}")
+        if has_harm_evidence:
+            print("Environmental-harm candidate")
+            if closest_org:
+                print(f"Closest organization in evidence: {closest_org}")
+        else:
+            print("No explicit environmental-harm evidence")
 
         rows.append(
             {
@@ -265,8 +370,9 @@ def enrich(args):
                 "Sentiment": sentiment_score,
                 "Scandal_distance": scandal_distance,
                 "Top_10": False,
-                "_Scandal_org": scandal_org,
-                "_Scandal_sentence": scandal_sentence,
+                "_Closest_org": closest_org,
+                "_Evidence_sentence": evidence_sentence,
+                "_Has_harm_evidence": has_harm_evidence,
             }
         )
 
@@ -274,18 +380,31 @@ def enrich(args):
     top_indices = result.nsmallest(10, "Scandal_distance").index
     result.loc[top_indices, "Top_10"] = True
 
-    print("\n---------- Top environmental scandal candidates ----------")
+    print("\n---------- Top environmental-harm candidates ----------")
     for _, row in result.loc[top_indices].sort_values(
         "Scandal_distance"
     ).iterrows():
-        organization = row["_Scandal_org"]
-        if organization:
-            print(f"Environmental scandal detected for {organization}")
-            print(f"  {row['Headline']}")
-            if row["_Scandal_sentence"]:
-                print(f"  Evidence: {row['_Scandal_sentence']}")
+        print(f"  {row['Headline']}")
+        print(f"  Distance: {row['Scandal_distance']:.4f}")
+        if row["_Has_harm_evidence"]:
+            print("  Environmental-harm candidate")
+            if row["_Closest_org"]:
+                print(
+                    "  Closest organization in evidence: "
+                    f"{row['_Closest_org']}"
+                )
+            if row["_Evidence_sentence"]:
+                print(f"  Evidence: {row['_Evidence_sentence']}")
+        else:
+            print("  No explicit environmental-harm evidence")
 
-    output = result.drop(columns=["_Scandal_org", "_Scandal_sentence"])
+    output = result.drop(
+        columns=[
+            "_Closest_org",
+            "_Evidence_sentence",
+            "_Has_harm_evidence",
+        ]
+    )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     output.to_csv(args.output, index=False)
     print(f"\nSaved {len(output)} enriched articles to {args.output}")
