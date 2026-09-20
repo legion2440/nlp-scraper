@@ -68,6 +68,10 @@ def iter_json_objects(value: object) -> Iterable[dict]:
             yield from iter_json_objects(child)
 
 
+def clean_inline_text(value: str | None) -> str:
+    return " ".join((value or "").split())
+
+
 def extract_article(html: str, url: str) -> Article | None:
     soup = BeautifulSoup(html, "html.parser")
     headline: str | None = None
@@ -113,7 +117,7 @@ def extract_article(html: str, url: str) -> Article | None:
         ]
         body = "\n".join(dict.fromkeys(paragraphs))
 
-    headline = (headline or "").strip()
+    headline = clean_inline_text(headline)
     body = (body or "").strip()
     if not headline or len(body) < 200:
         return None
@@ -249,7 +253,12 @@ def scrape(args: argparse.Namespace) -> int:
         print(f"Failed to load sitemap {args.sitemap}: {exc}")
         return 2
 
-    print(f"Discovered {len(urls)} candidate URLs")
+    video_urls = [url for url in urls if "/video/" in url]
+    urls = [url for url in urls if "/video/" not in url]
+    print(
+        f"Discovered {len(urls)} candidate URLs "
+        f"after excluding {len(video_urls)} video pages"
+    )
 
     connection = initialize_database(args.db)
     existing = stored_urls(connection)
