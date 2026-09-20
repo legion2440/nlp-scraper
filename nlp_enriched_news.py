@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sqlite3
 from pathlib import Path
 
@@ -116,7 +117,7 @@ def org_key(value):
 
 def is_ignored_org(value):
     normalized = org_key(value)
-    return normalized in IGNORED_ORGS or normalized.startswith("euronews ")
+    return normalized in IGNORED_ORGS or bool(re.match(r"^euronews\b", normalized))
 
 
 def normalized_orgs(entities):
